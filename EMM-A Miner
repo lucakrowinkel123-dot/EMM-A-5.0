@@ -15,6 +15,7 @@
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
 // minearea;depth;<gps or x,y,z>;<gps or x,y,z> : run distributed lanes over rectangle
+// nexthole : skip to the next generated area lane anchor
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
@@ -334,6 +335,9 @@ void RemoteCommand (string command)
             SetDrills(false);
             Echo("Mining cancelled.");
             break;
+        case "nexthole":
+            NextHole();
+            break;
         case "toffreset":
             TOFFR = 0;
             TOFFU = 0;
@@ -592,6 +596,33 @@ void UpdateMiningState()
             }
             break;
     }
+}
+
+void NextHole()
+{
+    if (areaLaneAnchors.Count == 0)
+    {
+        Echo("No area plan loaded. Start with minearea first.");
+        return;
+    }
+    if (areaLaneIndex + 1 >= areaLaneAnchors.Count)
+    {
+        Echo("Already at last hole.");
+        return;
+    }
+
+    SetDrills(false);
+    areaLaneIndex++;
+    areaMiningMode = true;
+    laneAnchor = areaLaneAnchors[areaLaneIndex];
+    targetPosition = laneAnchor;
+    desiredForward = drillAxis.LengthSquared() > 0.001 ? drillAxis : rc.WorldMatrix.Forward;
+    activeMaxSpeed = SPEEDB;
+    hasTarget = true;
+    autopilotEnabled = true;
+    miningEnabled = true;
+    miningState = MiningState.EnterLane;
+    Echo($"Next hole {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
 }
 
 bool IsAtTargetPosition(Vector3D target)
