@@ -14,7 +14,7 @@
 // clear : clears target and releases controls
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
-// minearea;depth;luX,luY,luZ;brX,brY,brZ : run distributed lanes over rectangle
+// minearea;depth;<gps or x,y,z>;<gps or x,y,z> : run distributed lanes over rectangle
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
@@ -394,11 +394,11 @@ void StartSingleLaneMining(string command)
 
 void StartAreaMining(string command)
 {
-    // minearea;depth;luX,luY,luZ;brX,brY,brZ
+    // minearea;depth;<gps or x,y,z>;<gps or x,y,z>
     string[] args = command.Split(';');
     if (args.Length < 4)
     {
-        Echo("Usage: minearea;depth;luX,luY,luZ;brX,brY,brZ");
+        Echo("Usage: minearea;depth;<gps or x,y,z>;<gps or x,y,z>");
         return;
     }
 
@@ -411,9 +411,9 @@ void StartAreaMining(string command)
 
     Vector3D leftUpper;
     Vector3D rightBottom;
-    if (!TryParseVector3(args[2], out leftUpper) || !TryParseVector3(args[3], out rightBottom))
+    if (!TryParsePoint(args[2], out leftUpper) || !TryParsePoint(args[3], out rightBottom))
     {
-        Echo("Invalid rectangle vectors. Format: x,y,z");
+        Echo("Invalid rectangle points. Use GPS:Name:X:Y:Z: or x,y,z");
         return;
     }
 
@@ -513,6 +513,34 @@ bool TryParseVector3(string csv, out Vector3D value)
         return false;
     value = new Vector3D(x, y, z);
     return true;
+}
+
+bool TryParsePoint(string text, out Vector3D value)
+{
+    value = Vector3D.Zero;
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    string t = text.Trim();
+    if (t.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+    {
+        string[] parts = t.Split(':');
+        if (parts.Length < 5)
+            return false;
+
+        double x, y, z;
+        if (!double.TryParse(parts[2], out x))
+            return false;
+        if (!double.TryParse(parts[3], out y))
+            return false;
+        if (!double.TryParse(parts[4], out z))
+            return false;
+
+        value = new Vector3D(x, y, z);
+        return true;
+    }
+
+    return TryParseVector3(t, out value);
 }
 
 void UpdateMiningState()
