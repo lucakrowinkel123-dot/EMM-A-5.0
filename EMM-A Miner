@@ -437,24 +437,26 @@ List<Vector3D> BuildRectangleLaneAnchors(Vector3D leftUpper, Vector3D rightBotto
     double height = Math.Abs(Vector3D.Dot(delta, down));
     double width = Math.Abs(Vector3D.Dot(delta, right));
 
-    int rows = Math.Max(1, (int)Math.Floor(height / laneHeight));
-    int cols = Math.Max(1, (int)Math.Floor(width / laneWidth));
+    // Use center points for each lane so the lane footprint stays inside bounds.
+    // Choose lane counts with Ceil() so we never leave uncovered gaps.
+    int rows = Math.Max(1, (int)Math.Ceiling(height / laneHeight));
+    int cols = Math.Max(1, (int)Math.Ceiling(width / laneWidth));
 
-    double hRemainder = height - rows * laneHeight;
-    double wRemainder = width - cols * laneWidth;
-    double rowOverlap = rows > 1 ? hRemainder / (rows - 1) : 0;
-    double colOverlap = cols > 1 ? wRemainder / (cols - 1) : 0;
-    double rowStep = rows > 1 ? laneHeight - rowOverlap : 0;
-    double colStep = cols > 1 ? laneWidth - colOverlap : 0;
+    // First/last lane centers are inset by half lane size from each border.
+    // Steps are compressed (overlap) to absorb odd remainders while keeping edges covered.
+    double rowStep = rows > 1 ? (height - laneHeight) / (rows - 1) : 0;
+    double colStep = cols > 1 ? (width - laneWidth) / (cols - 1) : 0;
+    double rowStart = rows > 1 ? laneHeight * 0.5 : height * 0.5;
+    double colStart = cols > 1 ? laneWidth * 0.5 : width * 0.5;
 
     for (int r = 0; r < rows; r++)
     {
-        Vector3D rowStart = leftUpper + down * (r * rowStep);
+        Vector3D rowOrigin = leftUpper + down * (rowStart + r * rowStep);
         bool reverse = (r % 2) == 1;
         for (int c = 0; c < cols; c++)
         {
             int ci = reverse ? (cols - 1 - c) : c;
-            Vector3D anchor = rowStart + right * (ci * colStep);
+            Vector3D anchor = rowOrigin + right * (colStart + ci * colStep);
             anchors.Add(anchor);
         }
     }
