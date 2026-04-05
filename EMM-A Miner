@@ -20,6 +20,8 @@
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
 // MINEW <value> : sets miner lane width footprint (m)
+// TOFF r,u,f : sets target offset in local Right,Up,Forward meters
+// TOFFRESET : clears target offset
 // =====================================
 
 Settings settings;
@@ -51,6 +53,9 @@ double SPEEDB = 6.0; // backing-out speed (m/s)
 double activeMaxSpeed = 0;
 double MINEH = 7.5; // miner lane height footprint (m)
 double MINEW = 7.5; // miner lane width footprint (m)
+double TOFFR = 0; // target offset Right (m)
+double TOFFU = 0; // target offset Up (m)
+double TOFFF = 0; // target offset Forward (m)
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
@@ -131,6 +136,7 @@ void WriteEcho()
     sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
     sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
+    sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
     sb.AppendLine("Faceforward = look toward target");
@@ -142,7 +148,8 @@ void WriteEcho()
 
 void Move ()
 {
-    Vector3D position = rc.GetPosition();
+    Vector3D worldOffset = GetTargetOffsetWorld();
+    Vector3D position = rc.GetPosition() + worldOffset;
     Vector3D toTarget = targetPosition - position;
     double tolerance = Math.Max(0.05, settings.arrivalTolerance.Value);
 
@@ -173,7 +180,14 @@ void Move ()
     }
 
     double maxSpeed = activeMaxSpeed > 0 ? activeMaxSpeed : settings.maxSpeed.Value;
-    thrust.ApplyAccel(thrust.ControlPosition(targetPosition, Vector3D.Zero, maxSpeed));
+    Vector3D rcTarget = targetPosition - worldOffset;
+    thrust.ApplyAccel(thrust.ControlPosition(rcTarget, Vector3D.Zero, maxSpeed));
+}
+
+Vector3D GetTargetOffsetWorld()
+{
+    MatrixD wm = rc.WorldMatrix;
+    return wm.Right * TOFFR + wm.Up * TOFFU + wm.Forward * TOFFF;
 }
 
 bool IsOrientationAligned(Vector3D forward, Vector3D up, double toleranceDeg)
@@ -265,6 +279,20 @@ void RemoteCommand (string command)
             Echo("Invalid MINEW value.");
         return;
     }
+    if (trimmed.StartsWith("TOFF ", StringComparison.OrdinalIgnoreCase))
+    {
+        Vector3D off;
+        if (TryParseVector3(trimmed.Substring(5).Trim(), out off))
+        {
+            TOFFR = off.X;
+            TOFFU = off.Y;
+            TOFFF = off.Z;
+            Echo($"TOFF set. R/U/F = {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+        }
+        else
+            Echo("Invalid TOFF. Use: TOFF r,u,f");
+        return;
+    }
 
     switch (trimmed.ToLower())
     {
@@ -305,6 +333,12 @@ void RemoteCommand (string command)
             activeMaxSpeed = 0;
             SetDrills(false);
             Echo("Mining cancelled.");
+            break;
+        case "toffreset":
+            TOFFR = 0;
+            TOFFU = 0;
+            TOFFF = 0;
+            Echo("TOFF reset to 0,0,0.");
             break;
         default:
             if (trimmed.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
@@ -535,7 +569,7 @@ void UpdateMiningState()
 bool IsAtTargetPosition(Vector3D target)
 {
     double tolerance = Math.Max(0.05, settings.arrivalTolerance.Value);
-    return Vector3D.DistanceSquared(rc.GetPosition(), target) < tolerance * tolerance;
+    return Vector3D.DistanceSquared(rc.GetPosition() + GetTargetOffsetWorld(), target) < tolerance * tolerance;
 }
 
 bool IsAtTargetPose(Vector3D target, Vector3D forward, Vector3D up)
