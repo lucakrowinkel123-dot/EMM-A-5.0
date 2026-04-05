@@ -60,6 +60,12 @@ double TOFFF = 0; // target offset Forward (m)
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
+bool retryCurrentLane = false;
+Vector3D stuckSamplePos = Vector3D.Zero;
+double stuckNoMoveSeconds = 0;
+const double stuckTimeoutSeconds = 5.0;
+const double stuckMoveThreshold = 0.25;
+double secondsPerTick = 1.0 / 60.0;
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -81,6 +87,11 @@ public Program ()
     thrust = new ThrusterControl(rc, settings.tickSpeed.Value, GetBlocks<IMyThrust>());
     gyros = new GyroControl(rc, settings.tickSpeed.Value, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
+
+    if (settings.tickSpeed.Value == UpdateFrequency.Update10)
+        secondsPerTick = 10.0 / 60.0;
+    else if (settings.tickSpeed.Value == UpdateFrequency.Update100)
+        secondsPerTick = 100.0 / 60.0;
 
     if (settings.tickSpeed.Value == UpdateFrequency.Update10)
         echoFrequency = 10;
@@ -317,6 +328,7 @@ void RemoteCommand (string command)
             areaMiningMode = false;
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
+            retryCurrentLane = false;
             activeMaxSpeed = 0;
             SetDrills(false);
             ResetMovement();
@@ -331,6 +343,7 @@ void RemoteCommand (string command)
             areaMiningMode = false;
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
+            retryCurrentLane = false;
             activeMaxSpeed = 0;
             SetDrills(false);
             Echo("Mining cancelled.");
@@ -374,6 +387,7 @@ void StartSingleLaneMining(string command)
     areaMiningMode = false;
     areaLaneAnchors.Clear();
     areaLaneIndex = 0;
+    retryCurrentLane = false;
 
     Vector3D fwd = desiredForward;
     if (fwd.LengthSquared() < 0.001)
@@ -453,6 +467,7 @@ void StartAreaMining(string command)
 
     areaMiningMode = true;
     areaLaneIndex = 0;
+    retryCurrentLane = false;
     laneAnchor = areaLaneAnchors[areaLaneIndex];
     targetPosition = laneAnchor;
     activeMaxSpeed = SPEEDB;
@@ -558,6 +573,7 @@ void UpdateMiningState()
             if (IsAtTargetPose(targetPosition, desiredForward, desiredUp))
             {
                 SetDrills(true);
+                ResetStuckMonitor();
                 miningState = MiningState.DrillForward;
             }
             break;
@@ -565,7 +581,13 @@ void UpdateMiningState()
             targetPosition = laneAnchor + drillAxis * laneDepth;
             desiredForward = drillAxis;
             activeMaxSpeed = SPEEDF;
-            if (IsAtTargetPosition(targetPosition))
+            if (CheckStuckInLane())
+            {
+                retryCurrentLane = true;
+                miningState = MiningState.Backout;
+                Echo("Stuck detected. Returning to anchor and retrying lane.");
+            }
+            else if (IsAtTargetPosition(targetPosition))
                 miningState = MiningState.Backout;
             break;
         case MiningState.Backout:
@@ -574,8 +596,15 @@ void UpdateMiningState()
             activeMaxSpeed = SPEEDB;
             if (IsAtTargetPosition(targetPosition))
             {
-                SetDrills(false);
-                if (areaMiningMode && areaLaneIndex + 1 < areaLaneAnchors.Count)
+                if (!retryCurrentLane)
+                    SetDrills(false);
+                if (retryCurrentLane)
+                {
+                    retryCurrentLane = false;
+                    miningState = MiningState.EnterLane;
+                    Echo($"Retrying lane {areaLaneIndex + 1}/{Math.Max(1, areaLaneAnchors.Count)}");
+                }
+                else if (areaMiningMode && areaLaneIndex + 1 < areaLaneAnchors.Count)
                 {
                     areaLaneIndex++;
                     laneAnchor = areaLaneAnchors[areaLaneIndex];
@@ -596,6 +625,32 @@ void UpdateMiningState()
             }
             break;
     }
+}
+
+void ResetStuckMonitor()
+{
+    stuckSamplePos = rc.GetPosition();
+    stuckNoMoveSeconds = 0;
+}
+
+bool CheckStuckInLane()
+{
+    double moved = Vector3D.DistanceSquared(rc.GetPosition(), stuckSamplePos);
+    if (moved < stuckMoveThreshold * stuckMoveThreshold)
+    {
+        stuckNoMoveSeconds += secondsPerTick;
+        if (stuckNoMoveSeconds >= stuckTimeoutSeconds)
+        {
+            ResetStuckMonitor();
+            return true;
+        }
+    }
+    else
+    {
+        stuckSamplePos = rc.GetPosition();
+        stuckNoMoveSeconds = 0;
+    }
+    return false;
 }
 
 void NextHole()
@@ -622,6 +677,7 @@ void NextHole()
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    retryCurrentLane = false;
     Echo($"Next hole {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
 }
 
