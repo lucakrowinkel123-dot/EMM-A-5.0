@@ -14,9 +14,12 @@
 // clear : clears target and releases controls
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
+// minearea;depth;luX,luY,luZ;brX,brY,brZ : run distributed lanes over rectangle
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
+// MINEH <value> : sets miner lane height footprint (m)
+// MINEW <value> : sets miner lane width footprint (m)
 // =====================================
 
 Settings settings;
@@ -46,6 +49,11 @@ double laneDepth = 0;
 double SPEEDF = 1.0; // forward drilling speed (m/s)
 double SPEEDB = 6.0; // backing-out speed (m/s)
 double activeMaxSpeed = 0;
+double MINEH = 7.5; // miner lane height footprint (m)
+double MINEW = 7.5; // miner lane width footprint (m)
+bool areaMiningMode = false;
+List<Vector3D> areaLaneAnchors = new List<Vector3D>();
+int areaLaneIndex = 0;
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -122,6 +130,9 @@ void WriteEcho()
     sb.AppendLine($"Mining: {miningState}");
     sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
+    sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
+    if (areaMiningMode && areaLaneAnchors.Count > 0)
+        sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
     sb.AppendLine("Faceforward = look toward target");
     sb.AppendLine("Faceup = align up to gravity-up (or current up in space)");
 
@@ -230,6 +241,30 @@ void RemoteCommand (string command)
             Echo("Invalid SPEEDB value.");
         return;
     }
+    if (trimmed.StartsWith("MINEH ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(6).Trim(), out v) && v > 0)
+        {
+            MINEH = v;
+            Echo($"MINEH set to {MINEH:0.00} m");
+        }
+        else
+            Echo("Invalid MINEH value.");
+        return;
+    }
+    if (trimmed.StartsWith("MINEW ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(6).Trim(), out v) && v > 0)
+        {
+            MINEW = v;
+            Echo($"MINEW set to {MINEW:0.00} m");
+        }
+        else
+            Echo("Invalid MINEW value.");
+        return;
+    }
 
     switch (trimmed.ToLower())
     {
@@ -250,6 +285,9 @@ void RemoteCommand (string command)
             desiredUp = Vector3D.Zero;
             miningEnabled = false;
             miningState = MiningState.Idle;
+            areaMiningMode = false;
+            areaLaneAnchors.Clear();
+            areaLaneIndex = 0;
             activeMaxSpeed = 0;
             SetDrills(false);
             ResetMovement();
@@ -261,6 +299,9 @@ void RemoteCommand (string command)
         case "cancelmine":
             miningEnabled = false;
             miningState = MiningState.Idle;
+            areaMiningMode = false;
+            areaLaneAnchors.Clear();
+            areaLaneIndex = 0;
             activeMaxSpeed = 0;
             SetDrills(false);
             Echo("Mining cancelled.");
@@ -268,6 +309,8 @@ void RemoteCommand (string command)
         default:
             if (trimmed.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
                 StartSingleLaneMining(trimmed);
+            else if (trimmed.StartsWith("minearea;", StringComparison.OrdinalIgnoreCase))
+                StartAreaMining(trimmed);
             break;
     }
 }
@@ -290,6 +333,9 @@ void StartSingleLaneMining(string command)
 
     laneDepth = depth;
     laneAnchor = hasTarget ? targetPosition : rc.GetPosition();
+    areaMiningMode = false;
+    areaLaneAnchors.Clear();
+    areaLaneIndex = 0;
 
     Vector3D fwd = desiredForward;
     if (fwd.LengthSquared() < 0.001)
@@ -310,6 +356,127 @@ void StartSingleLaneMining(string command)
     miningEnabled = true;
     miningState = MiningState.EnterLane;
     Echo($"Mining lane started. Depth={laneDepth:0.00}m");
+}
+
+void StartAreaMining(string command)
+{
+    // minearea;depth;luX,luY,luZ;brX,brY,brZ
+    string[] args = command.Split(';');
+    if (args.Length < 4)
+    {
+        Echo("Usage: minearea;depth;luX,luY,luZ;brX,brY,brZ");
+        return;
+    }
+
+    double depth;
+    if (!double.TryParse(args[1], out depth) || depth <= 0)
+    {
+        Echo("Invalid depth.");
+        return;
+    }
+
+    Vector3D leftUpper;
+    Vector3D rightBottom;
+    if (!TryParseVector3(args[2], out leftUpper) || !TryParseVector3(args[3], out rightBottom))
+    {
+        Echo("Invalid rectangle vectors. Format: x,y,z");
+        return;
+    }
+
+    Vector3D up = desiredUp;
+    if (up.LengthSquared() < 0.001)
+    {
+        Vector3D gravity = rc.GetNaturalGravity();
+        up = gravity.LengthSquared() > 0.001 ? Vector3D.Normalize(-gravity) : rc.WorldMatrix.Up;
+    }
+    up = Vector3D.Normalize(up);
+
+    Vector3D forward = desiredForward;
+    if (forward.LengthSquared() < 0.001)
+        forward = rc.WorldMatrix.Forward;
+    forward = Vector3D.Normalize(forward);
+
+    Vector3D right = Vector3D.Cross(forward, up);
+    if (right.LengthSquared() < 0.001)
+        right = rc.WorldMatrix.Right;
+    right = Vector3D.Normalize(right);
+
+    areaLaneAnchors = BuildRectangleLaneAnchors(leftUpper, rightBottom, up, right, MINEH, MINEW);
+    if (areaLaneAnchors.Count == 0)
+    {
+        Echo("Unable to generate area lanes.");
+        return;
+    }
+
+    laneDepth = depth;
+    drillAxis = forward;
+    desiredUp = up;
+    desiredForward = drillAxis;
+
+    areaMiningMode = true;
+    areaLaneIndex = 0;
+    laneAnchor = areaLaneAnchors[areaLaneIndex];
+    targetPosition = laneAnchor;
+    activeMaxSpeed = SPEEDB;
+    hasTarget = true;
+    autopilotEnabled = true;
+    miningEnabled = true;
+    miningState = MiningState.EnterLane;
+
+    Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
+}
+
+List<Vector3D> BuildRectangleLaneAnchors(Vector3D leftUpper, Vector3D rightBottom, Vector3D up, Vector3D right, double laneHeight, double laneWidth)
+{
+    List<Vector3D> anchors = new List<Vector3D>();
+    if (laneHeight <= 0 || laneWidth <= 0)
+        return anchors;
+
+    Vector3D down = -up;
+    Vector3D delta = rightBottom - leftUpper;
+    double height = Math.Abs(Vector3D.Dot(delta, down));
+    double width = Math.Abs(Vector3D.Dot(delta, right));
+
+    int rows = Math.Max(1, (int)Math.Floor(height / laneHeight));
+    int cols = Math.Max(1, (int)Math.Floor(width / laneWidth));
+
+    double hRemainder = height - rows * laneHeight;
+    double wRemainder = width - cols * laneWidth;
+    double rowOverlap = rows > 1 ? hRemainder / (rows - 1) : 0;
+    double colOverlap = cols > 1 ? wRemainder / (cols - 1) : 0;
+    double rowStep = rows > 1 ? laneHeight - rowOverlap : 0;
+    double colStep = cols > 1 ? laneWidth - colOverlap : 0;
+
+    for (int r = 0; r < rows; r++)
+    {
+        Vector3D rowStart = leftUpper + down * (r * rowStep);
+        bool reverse = (r % 2) == 1;
+        for (int c = 0; c < cols; c++)
+        {
+            int ci = reverse ? (cols - 1 - c) : c;
+            Vector3D anchor = rowStart + right * (ci * colStep);
+            anchors.Add(anchor);
+        }
+    }
+
+    return anchors;
+}
+
+bool TryParseVector3(string csv, out Vector3D value)
+{
+    value = Vector3D.Zero;
+    string[] t = csv.Split(',');
+    if (t.Length != 3)
+        return false;
+    double x, y, z;
+    if (!double.TryParse(t[0].Trim(), out x))
+        return false;
+    if (!double.TryParse(t[1].Trim(), out y))
+        return false;
+    if (!double.TryParse(t[2].Trim(), out z))
+        return false;
+    value = new Vector3D(x, y, z);
+    return true;
 }
 
 void UpdateMiningState()
@@ -340,11 +507,24 @@ void UpdateMiningState()
             if (IsAtTargetPosition(targetPosition))
             {
                 SetDrills(false);
-                miningEnabled = false;
-                miningState = MiningState.Idle;
-                autopilotEnabled = false;
-                activeMaxSpeed = 0;
-                Echo("Mining lane complete.");
+                if (areaMiningMode && areaLaneIndex + 1 < areaLaneAnchors.Count)
+                {
+                    areaLaneIndex++;
+                    laneAnchor = areaLaneAnchors[areaLaneIndex];
+                    miningState = MiningState.EnterLane;
+                    Echo($"Proceeding to lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
+                }
+                else
+                {
+                    miningEnabled = false;
+                    miningState = MiningState.Idle;
+                    autopilotEnabled = false;
+                    activeMaxSpeed = 0;
+                    areaMiningMode = false;
+                    areaLaneAnchors.Clear();
+                    areaLaneIndex = 0;
+                    Echo("Mining operation complete.");
+                }
             }
             break;
     }
