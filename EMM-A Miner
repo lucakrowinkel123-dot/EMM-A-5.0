@@ -23,6 +23,8 @@
 // MINEW <value> : sets miner lane width footprint (m)
 // TOFF r,u,f : sets target offset in local Right,Up,Forward meters
 // TOFFRESET : clears target offset
+// OREEXT on/off : enable depth extension when ore is found at depth checkpoints
+// ORESTEP <value> : extension step in meters (default 5)
 // =====================================
 
 Settings settings;
@@ -49,6 +51,7 @@ bool miningEnabled = false;
 Vector3D laneAnchor = Vector3D.Zero;
 Vector3D drillAxis = Vector3D.Zero;
 double laneDepth = 0;
+double laneBaseDepth = 0;
 double SPEEDF = 1.0; // forward drilling speed (m/s)
 double SPEEDB = 6.0; // backing-out speed (m/s)
 double activeMaxSpeed = 0;
@@ -57,6 +60,9 @@ double MINEW = 7.5; // miner lane width footprint (m)
 double TOFFR = 0; // target offset Right (m)
 double TOFFU = 0; // target offset Up (m)
 double TOFFF = 0; // target offset Forward (m)
+bool OREEXT = false;
+double ORESTEP = 5.0;
+double laneOreCheckpoint = 0;
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
@@ -149,6 +155,7 @@ void WriteEcho()
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
     sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+    sb.AppendLine($"OREEXT/ORESTEP: {OREEXT}/{ORESTEP:0.00} m");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
     sb.AppendLine("Faceforward = look toward target");
@@ -305,6 +312,35 @@ void RemoteCommand (string command)
             Echo("Invalid TOFF. Use: TOFF r,u,f");
         return;
     }
+    if (trimmed.StartsWith("ORESTEP ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(8).Trim(), out v) && v > 0)
+        {
+            ORESTEP = v;
+            Echo($"ORESTEP set to {ORESTEP:0.00} m");
+        }
+        else
+            Echo("Invalid ORESTEP value.");
+        return;
+    }
+    if (trimmed.StartsWith("OREEXT ", StringComparison.OrdinalIgnoreCase))
+    {
+        string mode = trimmed.Substring(7).Trim().ToLower();
+        if (mode == "on" || mode == "true" || mode == "1")
+        {
+            OREEXT = true;
+            Echo("OREEXT enabled.");
+        }
+        else if (mode == "off" || mode == "false" || mode == "0")
+        {
+            OREEXT = false;
+            Echo("OREEXT disabled.");
+        }
+        else
+            Echo("Usage: OREEXT on/off");
+        return;
+    }
 
     switch (trimmed.ToLower())
     {
@@ -383,6 +419,7 @@ void StartSingleLaneMining(string command)
     }
 
     laneDepth = depth;
+    laneBaseDepth = depth;
     laneAnchor = hasTarget ? targetPosition : rc.GetPosition();
     areaMiningMode = false;
     areaLaneAnchors.Clear();
@@ -461,6 +498,7 @@ void StartAreaMining(string command)
     }
 
     laneDepth = depth;
+    laneBaseDepth = depth;
     drillAxis = forward;
     desiredUp = up;
     desiredForward = drillAxis;
@@ -573,6 +611,7 @@ void UpdateMiningState()
             if (IsAtTargetPose(targetPosition, desiredForward, desiredUp))
             {
                 SetDrills(true);
+                laneOreCheckpoint = GetTotalOreInDrills();
                 ResetStuckMonitor();
                 miningState = MiningState.DrillForward;
             }
@@ -588,7 +627,16 @@ void UpdateMiningState()
                 Echo("Stuck detected. Returning to anchor and retrying lane.");
             }
             else if (IsAtTargetPosition(targetPosition))
-                miningState = MiningState.Backout;
+            {
+                if (OREEXT && ShouldExtendDepthFromOre())
+                {
+                    laneDepth += ORESTEP;
+                    ResetStuckMonitor();
+                    Echo($"Ore found at checkpoint. Extending depth to {laneDepth:0.00}m");
+                }
+                else
+                    miningState = MiningState.Backout;
+            }
             break;
         case MiningState.Backout:
             targetPosition = laneAnchor;
@@ -608,6 +656,7 @@ void UpdateMiningState()
                 {
                     areaLaneIndex++;
                     laneAnchor = areaLaneAnchors[areaLaneIndex];
+                    laneDepth = laneBaseDepth;
                     miningState = MiningState.EnterLane;
                     Echo($"Proceeding to lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
                 }
@@ -653,6 +702,36 @@ bool CheckStuckInLane()
     return false;
 }
 
+double GetTotalOreInDrills()
+{
+    double total = 0;
+    List<MyInventoryItem> items = new List<MyInventoryItem>();
+    foreach (var d in drills)
+    {
+        if (d == null || !d.IsFunctional)
+            continue;
+        var inv = d.GetInventory();
+        if (inv == null)
+            continue;
+        items.Clear();
+        inv.GetItems(items);
+        foreach (var item in items)
+        {
+            if (item.Type.TypeId == "MyObjectBuilder_Ore")
+                total += (double)item.Amount;
+        }
+    }
+    return total;
+}
+
+bool ShouldExtendDepthFromOre()
+{
+    double oreNow = GetTotalOreInDrills();
+    bool foundMoreOre = oreNow > laneOreCheckpoint + 0.001;
+    laneOreCheckpoint = oreNow;
+    return foundMoreOre;
+}
+
 void NextHole()
 {
     if (areaLaneAnchors.Count == 0)
@@ -670,6 +749,7 @@ void NextHole()
     areaLaneIndex++;
     areaMiningMode = true;
     laneAnchor = areaLaneAnchors[areaLaneIndex];
+    laneDepth = laneBaseDepth;
     targetPosition = laneAnchor;
     desiredForward = drillAxis.LengthSquared() > 0.001 ? drillAxis : rc.WorldMatrix.Forward;
     activeMaxSpeed = SPEEDB;
