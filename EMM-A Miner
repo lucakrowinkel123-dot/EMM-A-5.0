@@ -63,6 +63,7 @@ double TOFFF = 0; // target offset Forward (m)
 bool OREEXT = false;
 double ORESTEP = 5.0;
 double laneOreCheckpoint = 0;
+double laneOreObservedMax = 0;
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
@@ -612,6 +613,7 @@ void UpdateMiningState()
             {
                 SetDrills(true);
                 laneOreCheckpoint = GetTotalOreInDrills();
+                laneOreObservedMax = laneOreCheckpoint;
                 ResetStuckMonitor();
                 miningState = MiningState.DrillForward;
             }
@@ -620,6 +622,24 @@ void UpdateMiningState()
             targetPosition = laneAnchor + drillAxis * laneDepth;
             desiredForward = drillAxis;
             activeMaxSpeed = SPEEDF;
+            if (OREEXT)
+            {
+                double oreNow = GetTotalOreInDrills();
+                if (oreNow > laneOreObservedMax)
+                    laneOreObservedMax = oreNow;
+
+                // Check shortly before each checkpoint so we can extend without slowing at every 5m mark.
+                double leadDistance = Math.Max(0.5, SPEEDF * 1.0);
+                double remain = Vector3D.Distance(rc.GetPosition() + GetTargetOffsetWorld(), targetPosition);
+                if (remain <= leadDistance && laneOreObservedMax > laneOreCheckpoint + 0.001)
+                {
+                    laneOreCheckpoint = laneOreObservedMax;
+                    laneDepth += ORESTEP;
+                    ResetStuckMonitor();
+                    Echo($"Ore found near checkpoint. Extending depth to {laneDepth:0.00}m");
+                }
+            }
+
             if (CheckStuckInLane())
             {
                 retryCurrentLane = true;
@@ -628,14 +648,7 @@ void UpdateMiningState()
             }
             else if (IsAtTargetPosition(targetPosition))
             {
-                if (OREEXT && ShouldExtendDepthFromOre())
-                {
-                    laneDepth += ORESTEP;
-                    ResetStuckMonitor();
-                    Echo($"Ore found at checkpoint. Extending depth to {laneDepth:0.00}m");
-                }
-                else
-                    miningState = MiningState.Backout;
+                miningState = MiningState.Backout;
             }
             break;
         case MiningState.Backout:
@@ -722,14 +735,6 @@ double GetTotalOreInDrills()
         }
     }
     return total;
-}
-
-bool ShouldExtendDepthFromOre()
-{
-    double oreNow = GetTotalOreInDrills();
-    bool foundMoreOre = oreNow > laneOreCheckpoint + 0.001;
-    laneOreCheckpoint = oreNow;
-    return foundMoreOre;
 }
 
 void NextHole()
