@@ -14,17 +14,12 @@
 // clear : clears target and releases controls
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
-// minearea;depth;<gps or x,y,z>;<gps or x,y,z> : run distributed lanes over rectangle
-// nexthole : skip to the next generated area lane anchor
+// minearea;depth;luX,luY,luZ;brX,brY,brZ : run distributed lanes over rectangle
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
 // MINEW <value> : sets miner lane width footprint (m)
-// TOFF r,u,f : sets target offset in local Right,Up,Forward meters
-// TOFFRESET : clears target offset
-// OREEXT on/off : enable depth extension when ore is found at depth checkpoints
-// ORESTEP <value> : extension step in meters (default 5)
 // =====================================
 
 Settings settings;
@@ -51,28 +46,14 @@ bool miningEnabled = false;
 Vector3D laneAnchor = Vector3D.Zero;
 Vector3D drillAxis = Vector3D.Zero;
 double laneDepth = 0;
-double laneBaseDepth = 0;
 double SPEEDF = 1.0; // forward drilling speed (m/s)
 double SPEEDB = 6.0; // backing-out speed (m/s)
 double activeMaxSpeed = 0;
 double MINEH = 7.5; // miner lane height footprint (m)
 double MINEW = 7.5; // miner lane width footprint (m)
-double TOFFR = 0; // target offset Right (m)
-double TOFFU = 0; // target offset Up (m)
-double TOFFF = 0; // target offset Forward (m)
-bool OREEXT = false;
-double ORESTEP = 5.0;
-double laneOreCheckpoint = 0;
-double laneOreObservedMax = 0;
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
-bool retryCurrentLane = false;
-Vector3D stuckSamplePos = Vector3D.Zero;
-double stuckNoMoveSeconds = 0;
-const double stuckTimeoutSeconds = 5.0;
-const double stuckMoveThreshold = 0.25;
-double secondsPerTick = 1.0 / 60.0;
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -94,11 +75,6 @@ public Program ()
     thrust = new ThrusterControl(rc, settings.tickSpeed.Value, GetBlocks<IMyThrust>());
     gyros = new GyroControl(rc, settings.tickSpeed.Value, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
-
-    if (settings.tickSpeed.Value == UpdateFrequency.Update10)
-        secondsPerTick = 10.0 / 60.0;
-    else if (settings.tickSpeed.Value == UpdateFrequency.Update100)
-        secondsPerTick = 100.0 / 60.0;
 
     if (settings.tickSpeed.Value == UpdateFrequency.Update10)
         echoFrequency = 10;
@@ -155,8 +131,6 @@ void WriteEcho()
     sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
     sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
-    sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
-    sb.AppendLine($"OREEXT/ORESTEP: {OREEXT}/{ORESTEP:0.00} m");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
     sb.AppendLine("Faceforward = look toward target");
@@ -168,8 +142,7 @@ void WriteEcho()
 
 void Move ()
 {
-    Vector3D worldOffset = GetTargetOffsetWorld();
-    Vector3D position = rc.GetPosition() + worldOffset;
+    Vector3D position = rc.GetPosition();
     Vector3D toTarget = targetPosition - position;
     double tolerance = Math.Max(0.05, settings.arrivalTolerance.Value);
 
@@ -200,14 +173,7 @@ void Move ()
     }
 
     double maxSpeed = activeMaxSpeed > 0 ? activeMaxSpeed : settings.maxSpeed.Value;
-    Vector3D rcTarget = targetPosition - worldOffset;
-    thrust.ApplyAccel(thrust.ControlPosition(rcTarget, Vector3D.Zero, maxSpeed));
-}
-
-Vector3D GetTargetOffsetWorld()
-{
-    MatrixD wm = rc.WorldMatrix;
-    return wm.Right * TOFFR + wm.Up * TOFFU + wm.Forward * TOFFF;
+    thrust.ApplyAccel(thrust.ControlPosition(targetPosition, Vector3D.Zero, maxSpeed));
 }
 
 bool IsOrientationAligned(Vector3D forward, Vector3D up, double toleranceDeg)
@@ -299,49 +265,6 @@ void RemoteCommand (string command)
             Echo("Invalid MINEW value.");
         return;
     }
-    if (trimmed.StartsWith("TOFF ", StringComparison.OrdinalIgnoreCase))
-    {
-        Vector3D off;
-        if (TryParseVector3(trimmed.Substring(5).Trim(), out off))
-        {
-            TOFFR = off.X;
-            TOFFU = off.Y;
-            TOFFF = off.Z;
-            Echo($"TOFF set. R/U/F = {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
-        }
-        else
-            Echo("Invalid TOFF. Use: TOFF r,u,f");
-        return;
-    }
-    if (trimmed.StartsWith("ORESTEP ", StringComparison.OrdinalIgnoreCase))
-    {
-        double v;
-        if (double.TryParse(trimmed.Substring(8).Trim(), out v) && v > 0)
-        {
-            ORESTEP = v;
-            Echo($"ORESTEP set to {ORESTEP:0.00} m");
-        }
-        else
-            Echo("Invalid ORESTEP value.");
-        return;
-    }
-    if (trimmed.StartsWith("OREEXT ", StringComparison.OrdinalIgnoreCase))
-    {
-        string mode = trimmed.Substring(7).Trim().ToLower();
-        if (mode == "on" || mode == "true" || mode == "1")
-        {
-            OREEXT = true;
-            Echo("OREEXT enabled.");
-        }
-        else if (mode == "off" || mode == "false" || mode == "0")
-        {
-            OREEXT = false;
-            Echo("OREEXT disabled.");
-        }
-        else
-            Echo("Usage: OREEXT on/off");
-        return;
-    }
 
     switch (trimmed.ToLower())
     {
@@ -365,7 +288,6 @@ void RemoteCommand (string command)
             areaMiningMode = false;
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
-            retryCurrentLane = false;
             activeMaxSpeed = 0;
             SetDrills(false);
             ResetMovement();
@@ -380,19 +302,9 @@ void RemoteCommand (string command)
             areaMiningMode = false;
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
-            retryCurrentLane = false;
             activeMaxSpeed = 0;
             SetDrills(false);
             Echo("Mining cancelled.");
-            break;
-        case "nexthole":
-            NextHole();
-            break;
-        case "toffreset":
-            TOFFR = 0;
-            TOFFU = 0;
-            TOFFF = 0;
-            Echo("TOFF reset to 0,0,0.");
             break;
         default:
             if (trimmed.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
@@ -420,12 +332,10 @@ void StartSingleLaneMining(string command)
     }
 
     laneDepth = depth;
-    laneBaseDepth = depth;
     laneAnchor = hasTarget ? targetPosition : rc.GetPosition();
     areaMiningMode = false;
     areaLaneAnchors.Clear();
     areaLaneIndex = 0;
-    retryCurrentLane = false;
 
     Vector3D fwd = desiredForward;
     if (fwd.LengthSquared() < 0.001)
@@ -450,11 +360,11 @@ void StartSingleLaneMining(string command)
 
 void StartAreaMining(string command)
 {
-    // minearea;depth;<gps or x,y,z>;<gps or x,y,z>
+    // minearea;depth;luX,luY,luZ;brX,brY,brZ
     string[] args = command.Split(';');
     if (args.Length < 4)
     {
-        Echo("Usage: minearea;depth;<gps or x,y,z>;<gps or x,y,z>");
+        Echo("Usage: minearea;depth;luX,luY,luZ;brX,brY,brZ");
         return;
     }
 
@@ -467,9 +377,9 @@ void StartAreaMining(string command)
 
     Vector3D leftUpper;
     Vector3D rightBottom;
-    if (!TryParsePoint(args[2], out leftUpper) || !TryParsePoint(args[3], out rightBottom))
+    if (!TryParseVector3(args[2], out leftUpper) || !TryParseVector3(args[3], out rightBottom))
     {
-        Echo("Invalid rectangle points. Use GPS:Name:X:Y:Z: or x,y,z");
+        Echo("Invalid rectangle vectors. Format: x,y,z");
         return;
     }
 
@@ -499,14 +409,12 @@ void StartAreaMining(string command)
     }
 
     laneDepth = depth;
-    laneBaseDepth = depth;
     drillAxis = forward;
     desiredUp = up;
     desiredForward = drillAxis;
 
     areaMiningMode = true;
     areaLaneIndex = 0;
-    retryCurrentLane = false;
     laneAnchor = areaLaneAnchors[areaLaneIndex];
     targetPosition = laneAnchor;
     activeMaxSpeed = SPEEDB;
@@ -573,34 +481,6 @@ bool TryParseVector3(string csv, out Vector3D value)
     return true;
 }
 
-bool TryParsePoint(string text, out Vector3D value)
-{
-    value = Vector3D.Zero;
-    if (string.IsNullOrWhiteSpace(text))
-        return false;
-
-    string t = text.Trim();
-    if (t.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
-    {
-        string[] parts = t.Split(':');
-        if (parts.Length < 5)
-            return false;
-
-        double x, y, z;
-        if (!double.TryParse(parts[2], out x))
-            return false;
-        if (!double.TryParse(parts[3], out y))
-            return false;
-        if (!double.TryParse(parts[4], out z))
-            return false;
-
-        value = new Vector3D(x, y, z);
-        return true;
-    }
-
-    return TryParseVector3(t, out value);
-}
-
 void UpdateMiningState()
 {
     switch (miningState)
@@ -612,9 +492,6 @@ void UpdateMiningState()
             if (IsAtTargetPose(targetPosition, desiredForward, desiredUp))
             {
                 SetDrills(true);
-                laneOreCheckpoint = GetTotalOreInDrills();
-                laneOreObservedMax = laneOreCheckpoint;
-                ResetStuckMonitor();
                 miningState = MiningState.DrillForward;
             }
             break;
@@ -622,34 +499,8 @@ void UpdateMiningState()
             targetPosition = laneAnchor + drillAxis * laneDepth;
             desiredForward = drillAxis;
             activeMaxSpeed = SPEEDF;
-            if (OREEXT)
-            {
-                double oreNow = GetTotalOreInDrills();
-                if (oreNow > laneOreObservedMax)
-                    laneOreObservedMax = oreNow;
-
-                // Check shortly before each checkpoint so we can extend without slowing at every 5m mark.
-                double leadDistance = Math.Max(0.5, SPEEDF * 1.0);
-                double remain = Vector3D.Distance(rc.GetPosition() + GetTargetOffsetWorld(), targetPosition);
-                if (remain <= leadDistance && laneOreObservedMax > laneOreCheckpoint + 0.001)
-                {
-                    laneOreCheckpoint = laneOreObservedMax;
-                    laneDepth += ORESTEP;
-                    ResetStuckMonitor();
-                    Echo($"Ore found near checkpoint. Extending depth to {laneDepth:0.00}m");
-                }
-            }
-
-            if (CheckStuckInLane())
-            {
-                retryCurrentLane = true;
+            if (IsAtTargetPosition(targetPosition))
                 miningState = MiningState.Backout;
-                Echo("Stuck detected. Returning to anchor and retrying lane.");
-            }
-            else if (IsAtTargetPosition(targetPosition))
-            {
-                miningState = MiningState.Backout;
-            }
             break;
         case MiningState.Backout:
             targetPosition = laneAnchor;
@@ -657,19 +508,11 @@ void UpdateMiningState()
             activeMaxSpeed = SPEEDB;
             if (IsAtTargetPosition(targetPosition))
             {
-                if (!retryCurrentLane)
-                    SetDrills(false);
-                if (retryCurrentLane)
-                {
-                    retryCurrentLane = false;
-                    miningState = MiningState.EnterLane;
-                    Echo($"Retrying lane {areaLaneIndex + 1}/{Math.Max(1, areaLaneAnchors.Count)}");
-                }
-                else if (areaMiningMode && areaLaneIndex + 1 < areaLaneAnchors.Count)
+                SetDrills(false);
+                if (areaMiningMode && areaLaneIndex + 1 < areaLaneAnchors.Count)
                 {
                     areaLaneIndex++;
                     laneAnchor = areaLaneAnchors[areaLaneIndex];
-                    laneDepth = laneBaseDepth;
                     miningState = MiningState.EnterLane;
                     Echo($"Proceeding to lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
                 }
@@ -689,87 +532,10 @@ void UpdateMiningState()
     }
 }
 
-void ResetStuckMonitor()
-{
-    stuckSamplePos = rc.GetPosition();
-    stuckNoMoveSeconds = 0;
-}
-
-bool CheckStuckInLane()
-{
-    double moved = Vector3D.DistanceSquared(rc.GetPosition(), stuckSamplePos);
-    if (moved < stuckMoveThreshold * stuckMoveThreshold)
-    {
-        stuckNoMoveSeconds += secondsPerTick;
-        if (stuckNoMoveSeconds >= stuckTimeoutSeconds)
-        {
-            ResetStuckMonitor();
-            return true;
-        }
-    }
-    else
-    {
-        stuckSamplePos = rc.GetPosition();
-        stuckNoMoveSeconds = 0;
-    }
-    return false;
-}
-
-double GetTotalOreInDrills()
-{
-    double total = 0;
-    List<MyInventoryItem> items = new List<MyInventoryItem>();
-    foreach (var d in drills)
-    {
-        if (d == null || !d.IsFunctional)
-            continue;
-        var inv = d.GetInventory();
-        if (inv == null)
-            continue;
-        items.Clear();
-        inv.GetItems(items);
-        foreach (var item in items)
-        {
-            if (item.Type.TypeId == "MyObjectBuilder_Ore")
-                total += (double)item.Amount;
-        }
-    }
-    return total;
-}
-
-void NextHole()
-{
-    if (areaLaneAnchors.Count == 0)
-    {
-        Echo("No area plan loaded. Start with minearea first.");
-        return;
-    }
-    if (areaLaneIndex + 1 >= areaLaneAnchors.Count)
-    {
-        Echo("Already at last hole.");
-        return;
-    }
-
-    SetDrills(false);
-    areaLaneIndex++;
-    areaMiningMode = true;
-    laneAnchor = areaLaneAnchors[areaLaneIndex];
-    laneDepth = laneBaseDepth;
-    targetPosition = laneAnchor;
-    desiredForward = drillAxis.LengthSquared() > 0.001 ? drillAxis : rc.WorldMatrix.Forward;
-    activeMaxSpeed = SPEEDB;
-    hasTarget = true;
-    autopilotEnabled = true;
-    miningEnabled = true;
-    miningState = MiningState.EnterLane;
-    retryCurrentLane = false;
-    Echo($"Next hole {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
-}
-
 bool IsAtTargetPosition(Vector3D target)
 {
     double tolerance = Math.Max(0.05, settings.arrivalTolerance.Value);
-    return Vector3D.DistanceSquared(rc.GetPosition() + GetTargetOffsetWorld(), target) < tolerance * tolerance;
+    return Vector3D.DistanceSquared(rc.GetPosition(), target) < tolerance * tolerance;
 }
 
 bool IsAtTargetPose(Vector3D target, Vector3D forward, Vector3D up)
