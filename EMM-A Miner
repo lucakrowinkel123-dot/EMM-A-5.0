@@ -15,6 +15,7 @@
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
 // minearea;depth;luX,luY,luZ;brX,brY,brZ : run distributed lanes over rectangle
+// depth can be "N" or "N+ore" to continue while valuable ore is being mined
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
@@ -54,6 +55,10 @@ double MINEW = 7.5; // miner lane width footprint (m)
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
+bool depthPlusOreMode = false;
+int oreTicksSinceSeen = 0;
+readonly int oreLossGraceTicks = 60; // ~1s on Update1, ~10s on Update10
+readonly double oreModeMaxExtraDepth = 150.0; // safety cap
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -128,6 +133,7 @@ void WriteEcho()
     sb.AppendLine($"Arrival tolerance: {settings.arrivalTolerance.Value:0.00} m");
     sb.AppendLine($"Orientation tolerance: {settings.orientationToleranceDeg.Value:0.00} deg");
     sb.AppendLine($"Mining: {miningState}");
+    sb.AppendLine($"Depth+Ore: {(depthPlusOreMode ? "ON" : "OFF")}");
     sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
     sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
@@ -288,6 +294,8 @@ void RemoteCommand (string command)
             areaMiningMode = false;
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
+            depthPlusOreMode = false;
+            oreTicksSinceSeen = 0;
             activeMaxSpeed = 0;
             SetDrills(false);
             ResetMovement();
@@ -302,6 +310,8 @@ void RemoteCommand (string command)
             areaMiningMode = false;
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
+            depthPlusOreMode = false;
+            oreTicksSinceSeen = 0;
             activeMaxSpeed = 0;
             SetDrills(false);
             Echo("Mining cancelled.");
@@ -325,13 +335,16 @@ void StartSingleLaneMining(string command)
     }
 
     double depth;
-    if (!double.TryParse(args[1], out depth) || depth <= 0)
+    bool useDepthPlusOre;
+    if (!TryParseDepthArg(args[1], out depth, out useDepthPlusOre))
     {
-        Echo("Invalid depth.");
+        Echo("Invalid depth. Use: depth or depth+ore");
         return;
     }
 
     laneDepth = depth;
+    depthPlusOreMode = useDepthPlusOre;
+    oreTicksSinceSeen = 0;
     laneAnchor = hasTarget ? targetPosition : rc.GetPosition();
     areaMiningMode = false;
     areaLaneAnchors.Clear();
@@ -355,7 +368,7 @@ void StartSingleLaneMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
-    Echo($"Mining lane started. Depth={laneDepth:0.00}m");
+    Echo($"Mining lane started. Depth={laneDepth:0.00}m{(depthPlusOreMode ? " +ore" : "")}");
 }
 
 void StartAreaMining(string command)
@@ -369,9 +382,10 @@ void StartAreaMining(string command)
     }
 
     double depth;
-    if (!double.TryParse(args[1], out depth) || depth <= 0)
+    bool useDepthPlusOre;
+    if (!TryParseDepthArg(args[1], out depth, out useDepthPlusOre))
     {
-        Echo("Invalid depth.");
+        Echo("Invalid depth. Use: depth or depth+ore");
         return;
     }
 
@@ -409,6 +423,8 @@ void StartAreaMining(string command)
     }
 
     laneDepth = depth;
+    depthPlusOreMode = useDepthPlusOre;
+    oreTicksSinceSeen = 0;
     drillAxis = forward;
     desiredUp = up;
     desiredForward = drillAxis;
@@ -423,7 +439,7 @@ void StartAreaMining(string command)
     miningEnabled = true;
     miningState = MiningState.EnterLane;
 
-    Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
+    Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m{(depthPlusOreMode ? " +ore" : "")}");
 }
 
 List<Vector3D> BuildRectangleLaneAnchors(Vector3D leftUpper, Vector3D rightBottom, Vector3D up, Vector3D right, double laneHeight, double laneWidth)
@@ -481,6 +497,26 @@ bool TryParseVector3(string csv, out Vector3D value)
     return true;
 }
 
+bool TryParseDepthArg(string raw, out double depth, out bool depthPlusOre)
+{
+    depth = 0;
+    depthPlusOre = false;
+    if (string.IsNullOrWhiteSpace(raw))
+        return false;
+
+    string t = raw.Trim().ToLower();
+    if (t.EndsWith("+ore"))
+    {
+        depthPlusOre = true;
+        t = t.Substring(0, t.Length - 4).Trim();
+    }
+
+    if (!double.TryParse(t, out depth) || depth <= 0)
+        return false;
+
+    return true;
+}
+
 void UpdateMiningState()
 {
     switch (miningState)
@@ -496,10 +532,24 @@ void UpdateMiningState()
             }
             break;
         case MiningState.DrillForward:
-            targetPosition = laneAnchor + drillAxis * laneDepth;
+            double targetDepth = laneDepth;
+            if (depthPlusOreMode)
+                targetDepth = laneDepth + oreModeMaxExtraDepth;
+            targetPosition = laneAnchor + drillAxis * targetDepth;
             desiredForward = drillAxis;
             activeMaxSpeed = SPEEDF;
-            if (IsAtTargetPosition(targetPosition))
+            bool hasValuableOre = HasValuableOreInDrills();
+            if (hasValuableOre)
+                oreTicksSinceSeen = 0;
+            else
+                oreTicksSinceSeen++;
+
+            bool minimumDepthReached = GetCurrentLaneDepth() >= laneDepth;
+            bool finishedDepthPlusOre = depthPlusOreMode && minimumDepthReached && oreTicksSinceSeen >= oreLossGraceTicks;
+            bool reachedHardCap = IsAtTargetPosition(targetPosition);
+            bool finishedByDepth = !depthPlusOreMode && IsAtTargetPosition(laneAnchor + drillAxis * laneDepth);
+
+            if (finishedDepthPlusOre || reachedHardCap || finishedByDepth)
                 miningState = MiningState.Backout;
             break;
         case MiningState.Backout:
@@ -513,6 +563,7 @@ void UpdateMiningState()
                 {
                     areaLaneIndex++;
                     laneAnchor = areaLaneAnchors[areaLaneIndex];
+                    oreTicksSinceSeen = 0;
                     miningState = MiningState.EnterLane;
                     Echo($"Proceeding to lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
                 }
@@ -525,11 +576,44 @@ void UpdateMiningState()
                     areaMiningMode = false;
                     areaLaneAnchors.Clear();
                     areaLaneIndex = 0;
+                    depthPlusOreMode = false;
+                    oreTicksSinceSeen = 0;
                     Echo("Mining operation complete.");
                 }
             }
             break;
     }
+}
+
+double GetCurrentLaneDepth()
+{
+    return Vector3D.Dot(rc.GetPosition() - laneAnchor, drillAxis);
+}
+
+bool HasValuableOreInDrills()
+{
+    foreach (var d in drills)
+    {
+        if (d == null || !d.IsFunctional)
+            continue;
+
+        var inv = d.GetInventory();
+        if (inv == null)
+            continue;
+
+        List<MyInventoryItem> items = new List<MyInventoryItem>();
+        inv.GetItems(items);
+        foreach (var item in items)
+        {
+            string typeId = item.Type.TypeId.ToString();
+            if (!typeId.EndsWith("_Ore"))
+                continue;
+            string subtype = item.Type.SubtypeId.ToString();
+            if (!subtype.Equals("Stone", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+    }
+    return false;
 }
 
 bool IsAtTargetPosition(Vector3D target)
